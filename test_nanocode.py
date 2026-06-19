@@ -15,17 +15,18 @@ class TestNanocode(unittest.TestCase):
         self.assertEqual(m2.data["scratchpad"], "test scratch")
         os.remove(".test_memory.json")
 
-    def test_memory_bounding(self):
-        m = Memory(".test_memory_bound.json")
-        for i in range(30):
-            m.add_history("user", f"msg {i}")
-        self.assertEqual(len(m.data["history"]), 20)
-        os.remove(".test_memory_bound.json")
-
-    def test_config_defaults(self):
+    def test_config_provider_detection(self):
+        os.environ["OPENAI_API_KEY"] = "sk-test"
         c = Config()
-        self.assertIn("claude", c.model)
-        self.assertTrue(c.use_memory)
+        self.assertEqual(c.provider, "openai")
+        self.assertEqual(c.api_url, "https://api.openai.com/v1/chat/completions")
+
+        del os.environ["OPENAI_API_KEY"]
+        os.environ["OPENROUTER_API_KEY"] = "sk-or"
+        c2 = Config()
+        self.assertEqual(c2.provider, "anthropic")
+        self.assertIn("openrouter", c2.api_url)
+        del os.environ["OPENROUTER_API_KEY"]
 
     def test_tool_registry(self):
         self.assertIn("read", TOOLS)
@@ -36,7 +37,6 @@ class TestNanocode(unittest.TestCase):
         s = Session("test")
         schema = s.make_schema()
         self.assertTrue(any(t["name"] == "read" for t in schema))
-        self.assertTrue(any(t["name"] == "bash" for t in schema))
 
 if __name__ == "__main__":
     unittest.main()

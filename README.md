@@ -24,6 +24,8 @@ python nanocode.py
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL` | `claude-3-5-sonnet` | Model ID to use |
+| `OPENAI_API_KEY` | | OpenAI API Key (enables OpenAI provider) |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1/chat/completions` | Custom endpoint for OpenAI-compatible APIs |
 | `MEMORY` | `1` | Enable/disable persistent memory |
 | `PLANNER` | `0` | Enable/disable sub-agent planning |
 | `REVIEWER` | `0` | Enable/disable sub-agent reviewing |

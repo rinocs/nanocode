@@ -7,20 +7,28 @@ from typing import List, Dict, Any, Optional
 
 # --- Configuration ---
 
-@dataclass
 class Config:
-    anthropic_key: str = os.environ.get("ANTHROPIC_API_KEY", "")
-    openrouter_key: str = os.environ.get("OPENROUTER_API_KEY", "")
-    model: str = os.environ.get("MODEL", "")
-    verbose: bool = os.environ.get("VERBOSE", "0") == "1"
-    use_memory: bool = os.environ.get("MEMORY", "1") == "1"
-    use_planner: bool = os.environ.get("PLANNER", "0") == "1"
-    use_reviewer: bool = os.environ.get("REVIEWER", "0") == "1"
+    def __init__(self):
+        self.anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        self.openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        self.openai_key = os.environ.get("OPENAI_API_KEY", "")
+        self.openai_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
+        self.model = os.environ.get("MODEL", "")
+        self.verbose = os.environ.get("VERBOSE", "0") == "1"
+        self.use_memory = os.environ.get("MEMORY", "1") == "1"
+        self.use_planner = os.environ.get("PLANNER", "0") == "1"
+        self.use_reviewer = os.environ.get("REVIEWER", "0") == "1"
 
-    def __post_init__(self):
         if not self.model:
-            self.model = "anthropic/claude-3-5-sonnet" if self.openrouter_key else "claude-3-5-sonnet-20241022"
-        self.api_url = "https://openrouter.ai/api/v1/messages" if self.openrouter_key else "https://api.anthropic.com/v1/messages"
+            if self.openai_key: self.model = "gpt-4o"
+            elif self.openrouter_key: self.model = "anthropic/claude-3-5-sonnet"
+            else: self.model = "claude-3-5-sonnet-20241022"
+
+        if self.openai_key: self.api_url = self.openai_base
+        elif self.openrouter_key: self.api_url = "https://openrouter.ai/api/v1/messages"
+        else: self.api_url = "https://api.anthropic.com/v1/messages"
+
+        self.provider = "openai" if self.openai_key else "anthropic"
 
 cfg = Config()
 
@@ -48,7 +56,7 @@ class Memory:
 
     def add_history(self, role, content):
         self.data["history"].append({"role": role, "content": content})
-        if len(self.data["history"]) > 20: # Keep it bounded
+        if len(self.data["history"]) > 20:
             self.data["history"] = self.data["history"][-20:]
         self.save()
 
@@ -144,26 +152,72 @@ class Session:
             memory.add_history(role, content)
 
     def call_api(self, tools_override=None):
+        if cfg.provider == "openai":
+            return self._call_openai(tools_override)
+        return self._call_anthropic(tools_override)
+
+    def _call_anthropic(self, tools_override):
         tools = tools_override if tools_override is not None else self.make_schema()
-        payload = {
-            "model": cfg.model,
-            "max_tokens": 8192,
-            "system": self.system_prompt,
-            "messages": self.messages,
-        }
+        payload = {"model": cfg.model, "max_tokens": 8192, "system": self.system_prompt, "messages": self.messages}
         if tools: payload["tools"] = tools
 
+        headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+        if cfg.openrouter_key: headers["Authorization"] = f"Bearer {cfg.openrouter_key}"
+        else: headers["x-api-key"] = cfg.anthropic_key
+
+        return self._request(cfg.api_url, payload, headers)
+
+    def _call_openai(self, tools_override):
+        messages = [{"role": "system", "content": self.system_prompt}]
+        for m in self.messages:
+            role, content = m["role"], m["content"]
+            if role == "user" and isinstance(content, list):
+                for block in content:
+                    if block["type"] == "tool_result":
+                        messages.append({"role": "tool", "tool_call_id": block["tool_use_id"], "content": block["content"]})
+            elif role == "assistant" and isinstance(content, list):
+                text = ""
+                tool_calls = []
+                for block in content:
+                    if block["type"] == "text": text += block["text"]
+                    if block["type"] == "tool_use":
+                        tool_calls.append({"id": block["id"], "type": "function", "function": {"name": block["name"], "arguments": json.dumps(block["input"])}})
+                msg = {"role": "assistant", "content": text or None}
+                if tool_calls: msg["tool_calls"] = tool_calls
+                messages.append(msg)
+            else:
+                messages.append({"role": role, "content": content})
+
+        tools = []
+        for name, (desc, params, _) in TOOLS.items():
+            props = {}
+            required = []
+            for p_name, p_type in params.items():
+                opt = p_type.endswith("?")
+                base = p_type.rstrip("?")
+                props[p_name] = {"type": "integer" if base == "number" else "boolean" if base == "boolean" else base}
+                if not opt: required.append(p_name)
+            tools.append({"type": "function", "function": {"name": name, "description": desc, "parameters": {"type": "object", "properties": props, "required": required}}})
+
+        payload = {"model": cfg.model, "messages": messages}
+        if tools and tools_override is None: payload["tools"] = tools
+
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg.openai_key}"}
+        res = self._request(cfg.api_url, payload, headers)
+
+        choice = res["choices"][0]["message"]
+        content = []
+        if choice.get("content"):
+            content.append({"type": "text", "text": choice["content"]})
+        if choice.get("tool_calls"):
+            for tc in choice["tool_calls"]:
+                content.append({"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"], "input": json.loads(tc["function"]["arguments"])})
+        return {"content": content}
+
+    def _request(self, url, payload, headers):
         for attempt in range(3):
             try:
-                req = urllib.request.Request(
-                    cfg.api_url,
-                    data=json.dumps(payload).encode(),
-                    headers={
-                        "Content-Type": "application/json",
-                        "anthropic-version": "2023-06-01",
-                        **({"Authorization": f"Bearer {cfg.openrouter_key}"} if cfg.openrouter_key else {"x-api-key": cfg.anthropic_key}),
-                    },
-                )
+                req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
                 with urllib.request.urlopen(req) as res:
                     return json.loads(res.read())
             except Exception as e:
@@ -186,7 +240,6 @@ class Session:
 def run_agent(user_input: str):
     session = Session(f"Concise coding assistant. cwd: {os.getcwd()}")
 
-    # Optional Planning
     if cfg.use_planner:
         print(f"{YELLOW}⏺ Planning...{RESET}")
         plan_session = Session("You are a planner. Break the user request into a short bulleted plan.")
@@ -224,7 +277,6 @@ def run_agent(user_input: str):
         if not tool_results: break
         session.add_message("user", tool_results)
 
-    # Optional Review
     if cfg.use_reviewer:
         print(f"\n{YELLOW}⏺ Reviewing...{RESET}")
         rev_session = Session("You are a reviewer. Check if the task was completed correctly. Respond with 'OK' or suggestions.")
@@ -237,10 +289,9 @@ def run_agent(user_input: str):
 # --- CLI ---
 
 def main():
-    print(f"{BOLD}nanocode{RESET} | {DIM}{cfg.model} | {os.getcwd()}{RESET}")
+    print(f"{BOLD}nanocode{RESET} | {DIM}{cfg.model} ({cfg.provider}) | {os.getcwd()}{RESET}")
     if cfg.use_memory: print(f"{DIM}Memory enabled ({memory.path}){RESET}")
 
-    history = []
     while True:
         try:
             print(f"{DIM}{'─' * 40}{RESET}")
@@ -248,7 +299,6 @@ def main():
             if not cmd: continue
             if cmd in ("/q", "exit"): break
             if cmd == "/c":
-                history = []
                 if memory: memory.data["history"] = []; memory.save()
                 print(f"{GREEN}⏺ Cleared{RESET}")
                 continue
